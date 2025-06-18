@@ -12,7 +12,7 @@ from keras.layers import InputSpec, Layer, RNN, Dense, Dropout
 # Import required components
 from keras_efficient_kan import KANLinear
 from keras_sig import SigLayer
-from grns import GRKAN, GRN
+from .grns import GRKAN, GRN
 
 def get_backend():
     import os

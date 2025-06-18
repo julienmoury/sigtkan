@@ -4,8 +4,7 @@ from keras.layers import Layer, Dense, Dropout
 from keras_efficient_kan import KANLinear
 from keras_sig import SigLayer
 
-from grns import GRKAN, GRN
-from sigtkan import SigTKAN
+from .grns import GRKAN, GRN
 
 class SigKAN(Layer):
     def __init__(self, unit, sig_level, dropout = 0., **kwargs):
