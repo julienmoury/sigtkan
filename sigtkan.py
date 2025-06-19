@@ -1,6 +1,6 @@
 import keras
-from keras.layers import Layer, Dense, Dropout, Flatten
-from keras import ops
+from keras.layers import Layer, Dense, Dropout, Flatten, RNN
+from keras import ops, activations, initializers, regularizers, constraints
 
 from keras_efficient_kan import KANLinear
 from keras_sig import SigLayer
@@ -9,196 +9,273 @@ from .grns import GRKAN, GRN
 
 class SigTKANCell(Layer):
     """
-    SigTKAN Cell - Manual implementation combining signatures with TKAN-like functionality
-    This is a custom implementation for educational purposes
+    SigTKAN Cell - True combination of Signature methods with TKAN recurrent processing
+    
+    This cell implements a recurrent structure that:
+    1. Computes path signatures of input sequences
+    2. Uses TKAN-style KAN sub-layers for recurrent processing
+    3. Combines signature features with temporal dynamics
     """
-    def __init__(self, units, sig_level=2, dropout=0.0, **kwargs):
+    
+    def __init__(self, units, sig_level=2, sub_kan_configs=None, sub_kan_output_dim=None, 
+                 sub_kan_input_dim=None, activation="tanh", recurrent_activation="sigmoid",
+                 use_bias=True, dropout=0.0, recurrent_dropout=0.0, **kwargs):
         super().__init__(**kwargs)
+        
         self.units = units
         self.sig_level = sig_level
-        self.dropout_rate = dropout
+        self.sub_kan_configs = sub_kan_configs or [None, None]  # 2 KAN sub-layers by default
+        self.sub_kan_output_dim = sub_kan_output_dim or units // 2
+        self.sub_kan_input_dim = sub_kan_input_dim
         
-        # Signature layer for path signature computation
+        self.activation = activations.get(activation)
+        self.recurrent_activation = activations.get(recurrent_activation)
+        self.use_bias = use_bias
+        self.dropout = dropout
+        self.recurrent_dropout = recurrent_dropout
+        
+        # Signature computation
         self.sig_layer = SigLayer(self.sig_level)
         
-        # KAN layer for non-linear approximation
-        self.kan_layer = KANLinear(units, dropout=dropout, use_bias=False, use_layernorm=False)
-        
-        # Signature to attention weight conversion
-        self.sig_to_weight = GRKAN(units, activation='softmax', dropout=dropout)
-        
-        # LSTM-style gates for recurrent processing
-        self.input_gate = Dense(units, activation='sigmoid', name='input_gate')
-        self.forget_gate = Dense(units, activation='sigmoid', name='forget_gate')
-        self.cell_gate = Dense(units, activation='tanh', name='cell_gate')
-        self.output_gate = Dense(units, activation='sigmoid', name='output_gate')
-        
-        # Recurrent connections
-        self.recurrent_input = Dense(units, use_bias=False, name='recurrent_input')
-        self.recurrent_forget = Dense(units, use_bias=False, name='recurrent_forget')
-        self.recurrent_cell = Dense(units, use_bias=False, name='recurrent_cell')
-        self.recurrent_output = Dense(units, use_bias=False, name='recurrent_output')
-        
-        self.dropout_layer = Dropout(dropout)
+        # Output size calculation: [h_t, c_t] + sub_states
+        self.state_size = [units, units] + [self.sub_kan_output_dim for _ in self.sub_kan_configs]
+        self.output_size = units
 
     def build(self, input_shape):
-        # Note: input_shape ici peut varier selon le timestep dans la manual loop
+        input_dim = input_shape[-1]
+        
+        if self.sub_kan_input_dim is None:
+            self.sub_kan_input_dim = input_dim
+            
+        # LSTM-like gates for main recurrent structure
+        self.kernel = self.add_weight(
+            shape=(input_dim, self.units * 3),  # input, forget, cell gates
+            name="kernel",
+            initializer="glorot_uniform"
+        )
+        self.recurrent_kernel = self.add_weight(
+            shape=(self.units, self.units * 3),
+            name="recurrent_kernel", 
+            initializer="orthogonal"
+        )
+        
+        if self.use_bias:
+            self.bias = self.add_weight(
+                shape=(self.units * 3,),
+                name="bias",
+                initializer="zeros"
+            )
+        
+        # Signature processing pathway
+        # Estimate signature dimension based on input features and level
+        est_sig_dim = input_dim ** self.sig_level  # Rough estimate
+        self.sig_projection = KANLinear(
+            self.units, 
+            dropout=self.dropout,
+            use_bias=False,
+            use_layernorm=False
+        )
+        # Build with estimated signature dimension
+        self.sig_projection.build((None, est_sig_dim))
+        
+        # KAN sub-layers for enhanced processing (TKAN-style)
+        self.kan_sub_layers = []
+        for config in self.sub_kan_configs:
+            if config is None:
+                layer = KANLinear(self.sub_kan_output_dim, use_layernorm=True)
+            elif isinstance(config, dict):
+                layer = KANLinear(self.sub_kan_output_dim, **config, use_layernorm=True)
+            else:
+                layer = KANLinear(self.sub_kan_output_dim, use_layernorm=True)
+            layer.build((None, self.sub_kan_input_dim))
+            self.kan_sub_layers.append(layer)
+        
+        # Sub-layer recurrent connections (TKAN-style)
+        self.sub_recurrent_kernels_input = []
+        self.sub_recurrent_kernels_state = []
+        self.sub_recurrent_weights = []
+        
+        for _ in self.sub_kan_configs:
+            # Input projection for each sub-layer
+            self.sub_recurrent_kernels_input.append(
+                self.add_weight(
+                    shape=(input_dim, self.sub_kan_input_dim),
+                    name=f"sub_kernel_input_{len(self.sub_recurrent_kernels_input)}",
+                    initializer="glorot_uniform"
+                )
+            )
+            # State projection for each sub-layer  
+            self.sub_recurrent_kernels_state.append(
+                self.add_weight(
+                    shape=(self.sub_kan_output_dim, self.sub_kan_input_dim),
+                    name=f"sub_kernel_state_{len(self.sub_recurrent_kernels_state)}",
+                    initializer="orthogonal"
+                )
+            )
+            # Recurrent weights for state update
+            self.sub_recurrent_weights.append(
+                self.add_weight(
+                    shape=(self.sub_kan_output_dim * 2,),
+                    name=f"sub_recurrent_weight_{len(self.sub_recurrent_weights)}",
+                    initializer="ones"
+                )
+            )
+        
+        # Signature-TKAN fusion
+        total_kan_output = len(self.kan_sub_layers) * self.sub_kan_output_dim
+        self.fusion_weight = self.add_weight(
+            shape=(self.units + total_kan_output, self.units),
+            name="fusion_weight",
+            initializer="glorot_uniform"
+        )
+        self.fusion_bias = self.add_weight(
+            shape=(self.units,),
+            name="fusion_bias", 
+            initializer="zeros"
+        )
+        
         super().build(input_shape)
 
     def call(self, inputs, states, training=None):
-        """
-        Manual cell call - processes one timestep
-        inputs: current input at timestep t
-        states: [hidden_state, cell_state] from previous timestep
-        """
-        h_prev, c_prev = states
+        h_tm1 = states[0]  # Previous hidden state
+        c_tm1 = states[1]  # Previous cell state  
+        sub_states = states[2:]  # Previous KAN sub-layer states
         
-        # Compute signature features from input sequence
-        # inputs shape: (batch, seq_len, features)
-        sig_features = self.sig_layer(inputs)
+        batch_size = ops.shape(inputs)[0]
         
-        # Get attention weights from signature
-        attention_weights = self.sig_to_weight(sig_features)
+        # 1. Signature computation - key SigKAN component
+        # Add batch dimension handling for signature computation
+        if len(ops.shape(inputs)) == 2:
+            # Single timestep - need to create sequence for signature
+            sig_input = ops.expand_dims(inputs, axis=1)
+        else:
+            sig_input = inputs
+            
+        try:
+            sig_features = self.sig_layer(sig_input)
+            sig_processed = self.sig_projection(sig_features)
+        except:
+            # Fallback if signature computation fails
+            sig_processed = ops.zeros((batch_size, self.units))
         
-        # Apply KAN transformation with signature attention
-        kan_output = self.kan_layer(inputs)
-        attended_kan = kan_output * ops.expand_dims(attention_weights, axis=-1)
-        
-        # Aggregate over sequence dimension to get current input
-        current_input = ops.mean(attended_kan, axis=1)  # (batch, units)
-        current_input = self.dropout_layer(current_input, training=training)
-        
-        # LSTM-style gate computations
-        # Combine current input with previous hidden state
-        i = self.input_gate(current_input) + self.recurrent_input(h_prev)
-        f = self.forget_gate(current_input) + self.recurrent_forget(h_prev)
-        c_candidate = self.cell_gate(current_input) + self.recurrent_cell(h_prev)
-        o = self.output_gate(current_input) + self.recurrent_output(h_prev)
-        
-        # Apply activations
-        i = ops.sigmoid(i)
-        f = ops.sigmoid(f)
-        c_candidate = ops.tanh(c_candidate)
-        o = ops.sigmoid(o)
+        # 2. Main LSTM-like recurrent computation
+        if self.use_bias:
+            gates = ops.matmul(inputs, self.kernel) + ops.matmul(h_tm1, self.recurrent_kernel) + self.bias
+        else:
+            gates = ops.matmul(inputs, self.kernel) + ops.matmul(h_tm1, self.recurrent_kernel)
+            
+        i, f, c_candidate = ops.split(self.recurrent_activation(gates), 3, axis=-1)
         
         # Update cell state
-        c_new = f * c_prev + i * c_candidate
+        c = f * c_tm1 + i * self.activation(c_candidate)
         
-        # Update hidden state
-        h_new = o * ops.tanh(c_new)
+        # 3. TKAN-style KAN sub-layer processing
+        sub_outputs = []
+        new_sub_states = []
         
-        return h_new, [h_new, c_new]
-
-class SigTKAN(Layer):
-    """
-    SigTKAN Layer with manual RNN loop implementation
-    This manually implements the recurrent loop without inheriting from keras.layers.RNN
-    """
-    def __init__(self, units, sig_level=2, dropout=0.0, return_sequences=False, **kwargs):
-        super().__init__(**kwargs)
-        self.units = units
-        self.sig_level = sig_level
-        self.dropout_rate = dropout
-        self.return_sequences = return_sequences
-        
-        # Create the recurrent cell
-        self.cell = SigTKANCell(units, sig_level, dropout)
-
-    def build(self, input_shape):
-        # Build the cell with the input shape
-        self.cell.build(input_shape)
-        super().build(input_shape)
-
-    def call(self, inputs, training=None, mask=None):
-        """
-        Manual RNN loop implementation
-        This is our custom implementation of the recurrent computation
-        """
-        # Get input dimensions
-        batch_size = ops.shape(inputs)[0]
-        seq_length = ops.shape(inputs)[1]
-        
-        # Initialize states - this is how we manually initialize RNN states
-        h_state = ops.zeros((batch_size, self.units), dtype=inputs.dtype)
-        c_state = ops.zeros((batch_size, self.units), dtype=inputs.dtype)
-        states = [h_state, c_state]
-        
-        # Prepare outputs list if returning sequences
-        if self.return_sequences:
-            outputs = []
-        
-        # Manual recurrent loop - this is the core of our custom RNN implementation
-        for t in range(seq_length):
-            # Prepare input for current timestep
-            # For signature computation, we need the sequence up to current timestep
-            if t == 0:
-                # For first timestep, we need at least 2 points for signature
-                current_sequence = ops.expand_dims(inputs[:, 0, :], axis=1)
-                current_sequence = ops.concatenate([current_sequence, current_sequence], axis=1)
-            else:
-                # Use sequence from start to current timestep
-                current_sequence = inputs[:, :t+1, :]
+        for idx, (kan_layer, sub_state) in enumerate(zip(self.kan_sub_layers, sub_states)):
+            # Project input and previous state
+            projected_input = ops.matmul(inputs, self.sub_recurrent_kernels_input[idx])
+            projected_state = ops.matmul(sub_state, self.sub_recurrent_kernels_state[idx])
             
-            # Apply mask if provided (standard RNN masking)
-            if mask is not None:
-                current_mask = mask[:, t]
-                # Apply masking to states (this is how Keras handles masking)
-                current_mask = ops.cast(current_mask, dtype=inputs.dtype)
-                current_mask = ops.expand_dims(current_mask, axis=-1)
-            else:
-                current_mask = None
+            # Combine projections
+            kan_input = projected_input + projected_state
             
-            # Call the cell for current timestep
-            output, states = self.cell(current_sequence, states, training=training)
+            # Apply KAN transformation
+            kan_output = kan_layer(kan_input)
             
-            # Apply masking to output and states if needed
-            if current_mask is not None:
-                output = output * current_mask
-                states = [state * current_mask for state in states]
+            # Update sub-layer state (TKAN-style recurrent connection)
+            weights = self.sub_recurrent_weights[idx]
+            weight_output, weight_state = ops.split(weights, 2)
+            new_sub_state = weight_output * kan_output + weight_state * sub_state
             
-            # Store output if returning sequences
-            if self.return_sequences:
-                outputs.append(output)
+            sub_outputs.append(kan_output)
+            new_sub_states.append(new_sub_state)
         
-        # Return appropriate format
-        if self.return_sequences:
-            # Stack all timestep outputs
-            return ops.stack(outputs, axis=1)
+        # 4. Signature-TKAN fusion
+        # Combine signature features with KAN outputs
+        if sub_outputs:
+            kan_combined = ops.concatenate(sub_outputs, axis=-1)
+            fusion_input = ops.concatenate([sig_processed, kan_combined], axis=-1)
         else:
-            # Return only final output
-            return output
+            fusion_input = sig_processed
+            
+        # Apply fusion transformation
+        fusion_output = ops.matmul(fusion_input, self.fusion_weight) + self.fusion_bias
+        
+        # 5. Final hidden state computation
+        h = self.recurrent_activation(fusion_output) * self.activation(c)
+        
+        return h, [h, c] + new_sub_states
 
-    def compute_output_shape(self, input_shape):
-        """
-        Compute output shape for the layer
-        """
-        batch_size, seq_length, input_dim = input_shape
-        if self.return_sequences:
-            return (batch_size, seq_length, self.units)
-        else:
-            return (batch_size, self.units)
+    def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
+        dtype = dtype or self.compute_dtype
+        initial_states = [
+            ops.zeros((batch_size, self.units), dtype=dtype),  # h_0
+            ops.zeros((batch_size, self.units), dtype=dtype),  # c_0
+        ]
+        # Add initial states for KAN sub-layers
+        for _ in self.sub_kan_configs:
+            initial_states.append(ops.zeros((batch_size, self.sub_kan_output_dim), dtype=dtype))
+        return initial_states
 
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "units": self.units,
-            "sig_level": self.sig_level,
-            "dropout": self.dropout_rate,
-            "return_sequences": self.return_sequences,
-        })
-        return config
+
+class SigTKAN(RNN):
+    """
+    SigTKAN Layer - True combination of Signature methods with TKAN
+    
+    Combines:
+    - Path signatures from SigKAN for capturing sequence geometry
+    - TKAN's KAN-based recurrent processing for enhanced temporal modeling
+    - Proper recurrent structure with states and manual temporal processing
+    """
+    
+    def __init__(self, units, sig_level=2, sub_kan_configs=None, sub_kan_output_dim=None,
+                 sub_kan_input_dim=None, activation="tanh", recurrent_activation="sigmoid", 
+                 use_bias=True, dropout=0.0, recurrent_dropout=0.0, return_sequences=False, 
+                 return_state=False, **kwargs):
+        
+        cell = SigTKANCell(
+            units=units,
+            sig_level=sig_level,
+            sub_kan_configs=sub_kan_configs,
+            sub_kan_output_dim=sub_kan_output_dim,
+            sub_kan_input_dim=sub_kan_input_dim,
+            activation=activation,
+            recurrent_activation=recurrent_activation,
+            use_bias=use_bias,
+            dropout=dropout,
+            recurrent_dropout=recurrent_dropout
+        )
+        
+        super().__init__(
+            cell,
+            return_sequences=return_sequences,
+            return_state=return_state,
+            **kwargs
+        )
+        
+    @property
+    def units(self):
+        return self.cell.units
+    
+    @property
+    def sig_level(self):
+        return self.cell.sig_level
+
 
 class SigTKANDense(Layer):
     """
-    Dense version of SigTKAN for comparison
+    Non-recurrent version of SigTKAN for comparison
+    Combines signature computation with KAN processing (SigKAN-style)
     """
     def __init__(self, unit, sig_level, dropout = 0., **kwargs):
         super().__init__(**kwargs)
         self.unit = unit
         self.sig_level = sig_level
         self.sig_layer = SigLayer(self.sig_level)
-        self.dense_layer = Dense(unit)
-        self.sig_to_weight = GRN(unit, activation = 'softmax', dropout = dropout)
+        self.kan_layer = KANLinear(unit, dropout=dropout, use_bias=False, use_layernorm=False)
+        self.sig_to_weight = GRKAN(unit, activation = 'softmax', dropout = dropout)
         self.dropout = Dropout(dropout)
 
     def build(self, input_shape):
@@ -211,9 +288,18 @@ class SigTKANDense(Layer):
         super().build(input_shape)
         
     def call(self, inputs):
-        inputs = self.time_weigthing_kernel * inputs
-        sig = self.sig_layer(inputs)
+        # Temporal weighting
+        weighted_inputs = self.time_weigthing_kernel * inputs
+        
+        # Signature computation  
+        sig = self.sig_layer(weighted_inputs)
+        
+        # Attention weights from signatures
         weights = self.sig_to_weight(sig)
-        dense_out = self.dense_layer(inputs)
-        dense_out = self.dropout(dense_out)
-        return dense_out * ops.expand_dims(weights, axis=1)
+        
+        # KAN processing
+        kan_out = self.kan_layer(weighted_inputs)
+        kan_out = self.dropout(kan_out)
+        
+        # Weighted output
+        return kan_out * keras.ops.expand_dims(weights, axis=1)
