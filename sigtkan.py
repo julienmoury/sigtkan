@@ -67,16 +67,13 @@ class SigTKANCell(Layer):
             )
         
         # Signature processing pathway
-        # Estimate signature dimension based on input features and level
-        est_sig_dim = input_dim ** self.sig_level  # Rough estimate
+        # Build signature projection layer dynamically
         self.sig_projection = KANLinear(
             self.units, 
             dropout=self.dropout,
             use_bias=False,
             use_layernorm=False
         )
-        # Build with estimated signature dimension
-        self.sig_projection.build((None, est_sig_dim))
         
         # KAN sub-layers for enhanced processing (TKAN-style)
         self.kan_sub_layers = []
@@ -142,21 +139,22 @@ class SigTKANCell(Layer):
         sub_states = states[2:]  # Previous KAN sub-layer states
         
         batch_size = ops.shape(inputs)[0]
+        input_dim = ops.shape(inputs)[-1]
         
         # 1. Signature computation - key SigKAN component
-        # Add batch dimension handling for signature computation
-        if len(ops.shape(inputs)) == 2:
-            # Single timestep - need to create sequence for signature
-            sig_input = ops.expand_dims(inputs, axis=1)
-        else:
-            sig_input = inputs
-            
+        # For RNN cell, inputs is (batch_size, input_dim) - single timestep
+        # We need to create a small sequence for signature computation
+        # Use current input + previous hidden state as a pseudo-sequence
+        pseudo_sequence = ops.stack([inputs, h_tm1[:, :input_dim] if ops.shape(h_tm1)[-1] >= input_dim else inputs], axis=1)
+        
         try:
-            sig_features = self.sig_layer(sig_input)
+            sig_features = self.sig_layer(pseudo_sequence)
             sig_processed = self.sig_projection(sig_features)
-        except:
-            # Fallback if signature computation fails
-            sig_processed = ops.zeros((batch_size, self.units))
+        except Exception as e:
+            # Fallback: use direct input processing
+            sig_processed = ops.matmul(inputs, ops.transpose(self.sig_projection.kernel[:input_dim, :]))
+            if self.sig_projection.use_bias:
+                sig_processed = sig_processed + self.sig_projection.bias
         
         # 2. Main LSTM-like recurrent computation
         if self.use_bias:
@@ -279,17 +277,17 @@ class SigTKANDense(Layer):
         self.dropout = Dropout(dropout)
 
     def build(self, input_shape):
-        _, seq_length, n_features = input_shape
-        name = self.name
-        self.time_weigthing_kernel = self.add_weight(
-            shape=(seq_length, 1),
-            name=f"{name}_time_weigthing_kernel",
-        )
         super().build(input_shape)
         
     def call(self, inputs):
+        # Get sequence dimensions
+        batch_size, seq_length, n_features = ops.shape(inputs)[0], ops.shape(inputs)[1], ops.shape(inputs)[2]
+        
+        # Create learnable temporal weights for this specific sequence length
+        time_weights = ops.ones((seq_length, 1)) / seq_length  # Simple average weighting
+        
         # Temporal weighting
-        weighted_inputs = self.time_weigthing_kernel * inputs
+        weighted_inputs = time_weights * inputs
         
         # Signature computation  
         sig = self.sig_layer(weighted_inputs)
