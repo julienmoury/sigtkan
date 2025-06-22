@@ -66,11 +66,9 @@ class SigTKAN(Layer):
                 name=f"{name}_hidden_init_kernel",
                 initializer='glorot_uniform'
             )
-        # Calculer dimension tkan (d'ou le fait qu'on ai mis none dans l'init)
-        tkan_input_dim = n_features + (self.units if self.use_hidden_state else 0)
+
         self.tkan_layer = TKAN(self.units, dropout=self.dropout_rate, return_sequences=False, **self.tkan_kwargs)
-        tkan_input_shape = (None, 1, tkan_input_dim)
-        self.tkan_layer.build(tkan_input_shape)
+
         super().build(input_shape)
 
     # méthode call sans la boucle manuelle
@@ -79,25 +77,17 @@ class SigTKAN(Layer):
         # Apply time weighting (same as SigKAN)
         weighted_inputs = self.time_weighting_kernel * inputs
         
-        # Compute signatures
         sig = self.sig_layer(weighted_inputs)
         
-        # Get attention weights from signatures
         weights = self.sig_to_weight(sig)
-        
-        # Apply TKAN instead of KANLinear
         tkan_out = self.tkan_layer(weighted_inputs, training=training, **kwargs)
         
-        # Apply dropout
         tkan_out = self.dropout(tkan_out, training=training)
         
-        # Apply attention weighting - need to handle TKAN output shapes correctly
         if len(ops.shape(tkan_out)) == 3:  # return_sequences=True: (batch, seq, units)
-            # weights shape: (batch, units) -> expand to (batch, 1, units)
             weights_expanded = ops.expand_dims(weights, axis=1)
             return tkan_out * weights_expanded
         else:  # return_sequences=False: (batch, units)
-            # weights shape: (batch, units) - direct multiplication
             return tkan_out * weights
 
     # méthode call avec boucle manuelle
