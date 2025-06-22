@@ -8,16 +8,16 @@ from grns import GRKAN
 
 class SigTKAN(Layer):
     """
-    SigTKAN Layer - Combines TKAN recurrence with SigKAN-style signature processing.
+    SigTKAN Layer - Version simple et fonctionnelle.
     
     Args:
         units: int, dimensionality of TKAN output.
         sig_level: float, noise level for signature transform.
         dropout: float, dropout rate.
-        mode: 'manual' (loop time steps) or 'auto' (standard RNN mode).
+        mode: 'manual' (loop time steps).
         return_sequences: whether to return sequence or last time step.
         use_hidden_state: whether to propagate hidden state through time.
-        **tkan_kwargs: forwarded to TKAN (e.g., sub_kan_output_dim, sub_kan_input_dim, etc.)
+        **tkan_kwargs: forwarded to TKAN.
     """
 
     def __init__(self, units, sig_level, dropout=0., mode='manual', **tkan_kwargs):
@@ -25,10 +25,8 @@ class SigTKAN(Layer):
         if 'name' in tkan_kwargs:
             layer_kwargs['name'] = tkan_kwargs.pop('name')
 
-        # Appeler super().__init__ d'abord pour que Keras puisse tracer proprement
         super().__init__(**layer_kwargs)
 
-        # Nettoyage des kwargs
         self.return_sequences = tkan_kwargs.pop('return_sequences', True)
         self.use_hidden_state = tkan_kwargs.pop('use_hidden_state', True)
 
@@ -42,7 +40,7 @@ class SigTKAN(Layer):
         self.dropout = Dropout(dropout)
 
         self.tkan_kwargs = tkan_kwargs
-        self.tkan_layer = None  # construit dans build()
+        self.tkan_layer = None
 
     def build(self, input_shape):
         if len(input_shape) != 3:
@@ -67,40 +65,44 @@ class SigTKAN(Layer):
         self.tkan_layer = TKAN(
             self.units,
             dropout=self.dropout_rate,
-            return_sequences=False,  # boucle manuelle = pas de return_sequences ici
+            return_sequences=False,
             **self.tkan_kwargs
         )
 
         super().build(input_shape)
 
     def call(self, inputs, training=None, **kwargs):    
-        # Boucle manuelle
+
         weighted_inputs = self.time_weighting_kernel * inputs
         sig = self.sig_layer(weighted_inputs)
         weights = self.sig_to_weight(sig)
-
+        
+        seq_length = ops.shape(inputs)[1]
+        
         if self.use_hidden_state:
             hidden_state = ops.matmul(inputs[:, 0, :], self.hidden_init_kernel)
-
+        
         outputs = []
-        seq_length = ops.shape(inputs)[1]
-
+        
         for t in range(seq_length):
             x_t = inputs[:, t, :]
+            
             if self.use_hidden_state:
-                combined = ops.concatenate([x_t, hidden_state], axis=-1)
-                tkan_input = ops.expand_dims(combined, axis=1)
-            else:
-                tkan_input = ops.expand_dims(x_t, axis=1)
-
-            out_t = self.tkan_layer(tkan_input, training=training, **kwargs)
+                x_t = ops.concatenate([x_t, hidden_state], axis=-1)
+            
+            x_t = ops.expand_dims(x_t, axis=1)
+            
+            # Traitement TKAN
+            out_t = self.tkan_layer(x_t, training=training, **kwargs)
             out_t = self.dropout(out_t, training=training)
+            
+            # Application des poids de signatures
             weighted_out_t = out_t * weights
-
+            
+            outputs.append(weighted_out_t)
+            
             if self.use_hidden_state:
                 hidden_state = weighted_out_t
-
-            outputs.append(weighted_out_t)
 
         output_seq = ops.stack(outputs, axis=1)
         return output_seq if self.return_sequences else output_seq[:, -1, :]
