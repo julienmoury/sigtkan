@@ -1,8 +1,6 @@
 import keras
 from keras.layers import Layer, Dropout
 from keras import ops
-
-# Import existing components
 from tkan import TKAN
 from keras_sig import SigLayer
 from grns import GRKAN
@@ -53,6 +51,15 @@ class SigTKAN(Layer):
             name=f"{name}_time_weighting_kernel",
             initializer='ones'
         )
+        
+        self.sig_layer.build(input_shape)
+        self.tkan_layer.build(input_shape)
+        # Build signature to weight mapping
+        sig_output_shape = self.sig_layer.compute_output_shape(input_shape)
+        self.sig_to_weight.build(sig_output_shape)        
+        # Build dropout
+        tkan_output_shape = self.tkan_layer.compute_output_shape(input_shape)
+        self.dropout.build(tkan_output_shape)
         
         super().build(input_shape)
 
